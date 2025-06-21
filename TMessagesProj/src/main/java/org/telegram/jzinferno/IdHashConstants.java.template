@@ -1,0 +1,8 @@
+package org.telegram.jzinferno;
+
+public class IdHashConstants {
+    public static final int APP_ID = 4;
+    public static final String APP_HASH = "014b35b6184100b085b0d0572f9b5103";
+}
+
+// Rename to IdHashConstants.java
