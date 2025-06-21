@@ -1,6 +1,7 @@
 #include "IntroRenderer.h"
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include <jni.h>
 
 static int32_t is_initialized = 0;
