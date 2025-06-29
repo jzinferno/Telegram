@@ -223,6 +223,8 @@ import java.util.Locale;
 import java.util.Stack;
 import java.util.concurrent.atomic.AtomicReference;
 
+import org.telegram.jzinferno.WhisperHelper;
+
 public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate, ImageReceiver.ImageReceiverDelegate, DownloadController.FileDownloadProgressListener, TextSelectionHelper.SelectableView, NotificationCenter.NotificationCenterDelegate {
     private final static int TIME_APPEAR_MS = 200;
     private final static int UPLOADING_ALLOWABLE_ERROR = 1024 * 1024;
@@ -10914,6 +10916,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                     ) ||
                     TranscribeButton.canTranscribeTrial(currentMessageObject) || true
                 )
+                || WhisperHelper.useLocalTranscribe(currentAccount)
                 ||
                 MessagesController.getInstance(currentAccount).transcribeAudioTrialWeeklyNumber <= 0 &&
                 !MessagesController.getInstance(currentAccount).premiumFeaturesBlocked() &&

@@ -66,6 +66,10 @@ dependencies {
     implementation 'com.google.android.recaptcha:recaptcha:18.4.0'
 
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:1.1.5'
+
+    implementation files('libs/ffmpeg-kit-release.aar')
+    implementation files('libs/whisper_android-release.aar')
+    implementation 'com.arthenica:smart-exception-java:0.2.1'
 }
 
 def isWindows = String.valueOf(DefaultNativePlatform.currentOperatingSystem.toFamilyName() == OperatingSystemFamily.WINDOWS)
