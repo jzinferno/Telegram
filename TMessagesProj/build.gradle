@@ -67,16 +67,14 @@ dependencies {
 
     coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:1.1.5'
 
-    implementation files('libs/ffmpeg-kit-release.aar')
     implementation files('libs/whisper_android-release.aar')
-    implementation 'com.arthenica:smart-exception-java:0.2.1'
 }
 
 def isWindows = String.valueOf(DefaultNativePlatform.currentOperatingSystem.toFamilyName() == OperatingSystemFamily.WINDOWS)
 android {
     compileSdkVersion 35
     buildToolsVersion '35.0.0'
-    ndkVersion "27.2.12479018"
+    ndkVersion "27.3.13750724"
 
     sourceSets.main.jniLibs.srcDirs = ['./jni/']
 

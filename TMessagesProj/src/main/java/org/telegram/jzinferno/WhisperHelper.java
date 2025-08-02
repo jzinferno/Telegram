@@ -1,9 +1,9 @@
 package org.telegram.jzinferno;
 
 import android.content.Context;
+import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
-import android.media.MediaMuxer;
 import android.util.Log;
 
 import org.telegram.messenger.ApplicationLoader;
@@ -15,20 +15,21 @@ import org.telegram.ui.Components.AlertsCreator;
 import org.telegram.ui.Components.BulletinFactory;
 import org.telegram.ui.LaunchActivity;
 
-import com.arthenica.ffmpegkit.FFmpegKit;
-import com.jzinferno.whisper.LibWhisper;
-
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.BiConsumer;
+
+import com.jzinferno.whisper.LibWhisper;
 
 public class WhisperHelper {
     private static final String TAG = "WhisperHelper";
@@ -71,8 +72,7 @@ public class WhisperHelper {
 
         List<File> tempFiles = new ArrayList<>();
         try {
-            String audioPath = isVideo ? extractAudioFromVideo(path, tempFiles) : path;
-            String wavPath = convertToWavWithFFmpeg(audioPath, tempFiles);
+            String wavPath = convertToWav(path, tempFiles);
             String result = LibWhisper.transcribe(modelPath, wavPath, "auto", 4);
             callback.accept(result.trim(), null);
         } catch (Exception e) {
@@ -123,17 +123,39 @@ public class WhisperHelper {
         }
     }
 
-    private static String extractAudioFromVideo(String videoPath, List<File> tempFiles) throws IOException {
-        File audioFile = new File(videoPath + ".m4a");
-        tempFiles.add(audioFile);
+    private static String convertToWav(String inputPath, List<File> tempFiles) throws IOException {
+        String lowerPath = inputPath.toLowerCase();
 
+        if (lowerPath.endsWith(".wav")) {
+            return inputPath;
+        }
+
+        File audioDir = new File(ApplicationLoader.applicationContext.getFilesDir(), WHISPER_AUDIO_DIR);
+        if (!audioDir.exists() && !audioDir.mkdirs()) {
+            throw new IOException("Failed to create audio directory: " + audioDir.getAbsolutePath());
+        }
+
+        String randomName = generateRandomName();
+        File wavFile = new File(audioDir, randomName + ".wav");
+        tempFiles.add(wavFile);
+
+        convertToWavFile(inputPath, wavFile);
+
+        if (!wavFile.exists() || wavFile.length() == 0) {
+            throw new IOException("Audio conversion failed or produced empty file");
+        }
+
+        return wavFile.getAbsolutePath();
+    }
+
+    private static void convertToWavFile(String inputPath, File outputFile) throws IOException {
         MediaExtractor extractor = null;
-        MediaMuxer muxer = null;
-        boolean muxerStarted = false;
+        MediaCodec codec = null;
+        FileOutputStream fos = null;
 
         try {
             extractor = new MediaExtractor();
-            extractor.setDataSource(videoPath);
+            extractor.setDataSource(inputPath);
 
             MediaFormat audioFormat = null;
             int audioTrackIndex = -1;
@@ -151,75 +173,201 @@ public class WhisperHelper {
                 throw new IOException("No audio track found");
             }
 
-            muxer = new MediaMuxer(audioFile.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            int trackIndex = muxer.addTrack(audioFormat);
-            muxer.start();
-            muxerStarted = true;
+            String mime = audioFormat.getString(MediaFormat.KEY_MIME);
+            codec = MediaCodec.createDecoderByType(mime);
+            codec.configure(audioFormat, null, null, 0);
+            codec.start();
 
             extractor.selectTrack(audioTrackIndex);
 
-            android.media.MediaCodec.BufferInfo bufferInfo = new android.media.MediaCodec.BufferInfo();
-            ByteBuffer buffer = ByteBuffer.allocate(65536);
+            fos = new FileOutputStream(outputFile);
 
-            while (true) {
-                int sampleSize = extractor.readSampleData(buffer, 0);
-                if (sampleSize < 0) break;
+            writeWavHeader(fos, 0);
 
-                bufferInfo.offset = 0;
-                bufferInfo.size = sampleSize;
-                bufferInfo.presentationTimeUs = extractor.getSampleTime();
-                bufferInfo.flags = 0;
+            ByteBuffer[] inputBuffers = codec.getInputBuffers();
+            ByteBuffer[] outputBuffers = codec.getOutputBuffers();
+            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
 
-                muxer.writeSampleData(trackIndex, buffer, bufferInfo);
-                extractor.advance();
+            boolean isEOS = false;
+            long totalPcmBytes = 0;
+
+            while (!isEOS) {
+                int inputBufferIndex = codec.dequeueInputBuffer(10000);
+                if (inputBufferIndex >= 0) {
+                    ByteBuffer inputBuffer = inputBuffers[inputBufferIndex];
+                    int sampleSize = extractor.readSampleData(inputBuffer, 0);
+
+                    if (sampleSize < 0) {
+                        codec.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        isEOS = true;
+                    } else {
+                        codec.queueInputBuffer(inputBufferIndex, 0, sampleSize, extractor.getSampleTime(), 0);
+                        extractor.advance();
+                    }
+                }
+
+                int outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 10000);
+                if (outputBufferIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                    outputBuffers = codec.getOutputBuffers();
+                } else if (outputBufferIndex >= 0) {
+                    ByteBuffer outputBuffer = outputBuffers[outputBufferIndex];
+
+                    if (bufferInfo.size > 0) {
+                        byte[] pcmData = convertPcmToWhisperFormat(outputBuffer, bufferInfo, audioFormat);
+                        if (pcmData != null && pcmData.length > 0) {
+                            fos.write(pcmData);
+                            totalPcmBytes += pcmData.length;
+                        }
+                    }
+
+                    codec.releaseOutputBuffer(outputBufferIndex, false);
+
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        break;
+                    }
+                }
             }
 
-            return audioFile.getAbsolutePath();
+            fos.close();
+            fos = null;
+            updateWavHeader(outputFile, totalPcmBytes);
 
         } finally {
-            if (muxer != null) {
+            if (fos != null) {
                 try {
-                    if (muxerStarted) muxer.stop();
-                    muxer.release();
+                    fos.close();
+                } catch (IOException e) {
+                    Log.w(TAG, "Error closing FileOutputStream", e);
+                }
+            }
+            if (codec != null) {
+                try {
+                    codec.stop();
+                    codec.release();
                 } catch (Exception e) {
-                    Log.w(TAG, "Error releasing MediaMuxer", e);
+                    Log.w(TAG, "Error releasing codec", e);
                 }
             }
             if (extractor != null) {
                 try {
                     extractor.release();
                 } catch (Exception e) {
-                    Log.w(TAG, "Error releasing MediaExtractor", e);
+                    Log.w(TAG, "Error releasing extractor", e);
                 }
             }
         }
     }
 
-    private static String convertToWavWithFFmpeg(String inputPath, List<File> tempFiles) throws IOException {
-        String lowerPath = inputPath.toLowerCase();
+    private static byte[] convertPcmToWhisperFormat(ByteBuffer outputBuffer, MediaCodec.BufferInfo bufferInfo, MediaFormat originalFormat) {
+        outputBuffer.position(bufferInfo.offset);
+        outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
 
-        if (lowerPath.endsWith(".wav")) {
-            return inputPath;
+        int originalSampleRate = originalFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+        int channelCount = originalFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+
+        int sampleCount = bufferInfo.size / 2;
+        short[] samples = new short[sampleCount];
+
+        outputBuffer.order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < sampleCount; i++) {
+            samples[i] = outputBuffer.getShort();
         }
 
-        File audioDir = new File(ApplicationLoader.applicationContext.getFilesDir(), WHISPER_AUDIO_DIR);
-        if (!audioDir.exists() && !audioDir.mkdirs()) {
-            throw new IOException("Failed to create audio directory: " + audioDir.getAbsolutePath());
+        if (channelCount > 1) {
+            samples = convertToMono(samples, channelCount);
         }
 
-        String randomName = generateRandomName();
-        File wavFile = new File(audioDir, randomName + ".wav");
-        tempFiles.add(wavFile);
-
-        String command = String.format("-y -i \"%s\" -acodec pcm_s16le -ac 1 -ar 16000 \"%s\"",
-                inputPath, wavFile.getAbsolutePath());
-        FFmpegKit.execute(command);
-
-        if (!wavFile.exists() || wavFile.length() == 0) {
-            throw new IOException("FFmpeg conversion failed or produced empty file");
+        if (originalSampleRate != 16000) {
+            samples = resample(samples, originalSampleRate, 16000);
         }
 
-        return wavFile.getAbsolutePath();
+        ByteBuffer result = ByteBuffer.allocate(samples.length * 2);
+        result.order(ByteOrder.LITTLE_ENDIAN);
+        for (short sample : samples) {
+            result.putShort(sample);
+        }
+        return result.array();
+    }
+
+    private static short[] convertToMono(short[] stereoSamples, int channelCount) {
+        int monoLength = stereoSamples.length / channelCount;
+        short[] monoSamples = new short[monoLength];
+
+        for (int i = 0; i < monoLength; i++) {
+            if (channelCount == 2) {
+                long sum = (long) stereoSamples[i * 2] + stereoSamples[i * 2 + 1];
+                monoSamples[i] = (short) Math.max(Short.MIN_VALUE, Math.min(Short.MAX_VALUE, sum));
+            } else {
+                long sum = 0;
+                for (int ch = 0; ch < channelCount; ch++) {
+                    sum += stereoSamples[i * channelCount + ch];
+                }
+                monoSamples[i] = (short) (sum / channelCount);
+            }
+        }
+
+        return monoSamples;
+    }
+
+    private static short[] resample(short[] input, int inputRate, int outputRate) {
+        if (inputRate == outputRate) {
+            return input;
+        }
+
+        double ratio = (double) inputRate / outputRate;
+        int outputLength = (int) (input.length / ratio);
+        short[] output = new short[outputLength];
+
+        for (int i = 0; i < outputLength; i++) {
+            double srcIndex = i * ratio;
+            int srcIndexInt = (int) srcIndex;
+
+            if (srcIndexInt >= input.length - 1) {
+                output[i] = input[input.length - 1];
+            } else {
+                double fraction = srcIndex - srcIndexInt;
+                double sample1 = input[srcIndexInt];
+                double sample2 = input[srcIndexInt + 1];
+                output[i] = (short) (sample1 + fraction * (sample2 - sample1));
+            }
+        }
+
+        return output;
+    }
+
+    private static void writeWavHeader(FileOutputStream fos, long dataSize) throws IOException {
+        ByteBuffer header = ByteBuffer.allocate(44);
+        header.order(ByteOrder.LITTLE_ENDIAN);
+        header.put("RIFF".getBytes());
+        header.putInt((int) (dataSize + 36));
+        header.put("WAVE".getBytes());
+        header.put("fmt ".getBytes());
+        header.putInt(16);
+        header.putShort((short) 1);
+        header.putShort((short) 1);
+        header.putInt(16000);
+        header.putInt(32000);
+        header.putShort((short) 2);
+        header.putShort((short) 16);
+        header.put("data".getBytes());
+        header.putInt((int) dataSize);
+        fos.write(header.array());
+    }
+
+    private static void updateWavHeader(File wavFile, long totalPcmBytes) throws IOException {
+        try (RandomAccessFile raf = new RandomAccessFile(wavFile, "rw")) {
+            long totalDataLen = totalPcmBytes + 36;
+            raf.seek(4);
+            raf.write((int) (totalDataLen & 0xff));
+            raf.write((int) ((totalDataLen >> 8) & 0xff));
+            raf.write((int) ((totalDataLen >> 16) & 0xff));
+            raf.write((int) ((totalDataLen >> 24) & 0xff));
+            raf.seek(40);
+            raf.write((int) (totalPcmBytes & 0xff));
+            raf.write((int) ((totalPcmBytes >> 8) & 0xff));
+            raf.write((int) ((totalPcmBytes >> 16) & 0xff));
+            raf.write((int) ((totalPcmBytes >> 24) & 0xff));
+        }
     }
 
     private static String generateRandomName() {
@@ -228,6 +376,7 @@ public class WhisperHelper {
             char c = (char) ('a' + random.nextInt(26));
             sb.append(c);
         }
+
         return sb.toString();
     }
 
